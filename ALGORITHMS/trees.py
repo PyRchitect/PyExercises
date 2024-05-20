@@ -355,9 +355,9 @@ def PBT_test():
 			p = binom.pmf(k=x,n=depth,p=test_trial_probability)
 			print(f"[{i}xL,{depth-i}xD] P = {p:.{rounding}f}")
 
-	# test_random()
+	test_random()
 
-	# test_binomial()
+	test_binomial()
 
 def T_test():
 	# driver code:
@@ -380,3 +380,4 @@ def T_test():
 	print([x.data for x in root.postorder()])
 
 T_test()
+PBT_test()
