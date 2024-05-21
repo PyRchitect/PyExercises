@@ -1,4 +1,4 @@
-# Meteo
+# Smartkey
 
 <h3>General notes:</h3>
 
