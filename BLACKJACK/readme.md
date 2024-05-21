@@ -2,7 +2,7 @@
 
 <h3>General notes:</h3>
 
-<p>Using a well-known procedure to explore object separation and dynamical inputs. The game is incoplete, only basic rules were implemented</p>
+<p>Using a well-known procedure to explore object separation and dynamical inputs. The game is incomplete, only basic rules were implemented</p>
 
 <h3>Notes about subjects explored:</h3>
 
