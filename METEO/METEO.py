@@ -1,16 +1,13 @@
 from sys import path as sys_path			# working folder
 from datetime import datetime as dt			# get date time now
-from threading import 	Thread,		\
-	 					Event as tEvent		# background processing
+import threading as th						# background IO processing						
 from enum import Enum						# const enumeration
 
-from PIL import Image,ImageTk				# img adjustments
-from requests import get as rget			# xml retrieve
-import xml.etree.ElementTree as ET			# xml parsing
-
-from sense_emu import SenseHat				# RPi sense hat
+import configparser as cp					# RPi config
 import paramiko								# SSH to RPIs
-import random as rn							# test hat randomization
+from sense_emu import SenseHat				# RPi sense hat
+from subprocess import Popen, PIPE, STDOUT	# direct command to RPi
+from random import uniform					# test hat randomization
 
 import tkinter as tk						# interface
 from tkinter import 	ttk,		\
@@ -21,6 +18,10 @@ from tkinter import 	ttk,		\
 class DependenciesError(Exception):
 	def __str__(self):
 		return 	"External dependencies:"								+ \
+				"\n> PIL (pip install pillow)"							+ \
+				"\n> requests (pip install requests)"					+ \
+				"\n> paramiko (pip install paramiko)"					+ \
+				"\n> sense_emu (pip install sense-emu)"					+ \
 				"\n> sqlalchemy (pip install sqlalchemy)"				+ \
 				"\n> sqlalchemy_utils (pip install sqlalchemy_utils)"
 
@@ -44,32 +45,37 @@ class SensorConnectError(Exception):
 	def __str__(self):
 		return "Pogreška pri spajanju na senzor!"
 
+class ConfigReadError(Exception):
+	def __str__(self):
+		return "Pogreška pri otvaranju konfiguracijskog filea!"
+
 # </EXCEPTIONS> - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 # <SENSORS>
 
 class SensorSSH():
 	# "real" RPi
-	def __init__(self,name,ip,user,pkf,sf):
+	def __init__(self,sensor_data):
 		self.type = "SSH"
-		self.name = name
+		self.name = sensor_data['NAME']
+		self.sensor_types = ['temp','vlaga','tlak']
 
-		self.ip = ip
-		self.user = user
-		self.sf = sf
+		self.ip = sensor_data['IP']
+		self.user = sensor_data['USER']
+		self.sf = sensor_data['SF']
 
-		from io import StringIO
-		pkf = StringIO(open(pkf).read())	# convert to stream
-		self.pk = paramiko.Ed25519Key.from_private_key(pkf)
+		from io import StringIO		# convert to stream
+		pkf_stream = StringIO(open(sensor_data['PKF']).read())
+		self.pk = paramiko.Ed25519Key.from_private_key(pkf_stream)
 
 		self.client = self.ssh_client_create()
 
 		# attempt to start GUI (probe connection)
-		process_name = 'sense_emu_gui'
+		self.process_name = 'sense_emu_gui'
 		try:
-			self.start_process(process_name)
+			self.start_process()
 		except:
 			raise SensorConnectError
-		
+
 		# # # TEST
 		# temp = self.get_data('temp')
 		# vlaga = self.get_data('vlaga')
@@ -79,12 +85,12 @@ class SensorSSH():
 		client = paramiko.SSHClient()
 		client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 		return client
-	
-	def start_process(self, process_name):
+
+	def start_process(self):
 		self.client.connect(self.ip,username=self.user,pkey=self.pk)
 
 		# get count of process:
-		command = f"pgrep -c {process_name}"
+		command = f"pgrep -c {self.process_name}"
 		# execute command on server
 		_stdin, stdout, _stderr = self.client.exec_command(command)
 		# read output
@@ -99,7 +105,7 @@ class SensorSSH():
 			# > otherwise login as user, echo
 
 			# launch directly from session
-			launch = "export DISPLAY=:0;sense_emu_gui"
+			launch = f"export DISPLAY=:0;{self.process_name}"
 			_stdin, stdout, stderr = self.client.exec_command(launch)
 
 			# launch from launcher script placed on the PI
@@ -107,17 +113,30 @@ class SensorSSH():
 			# _stdin, stdout, stderr = client.exec_command(launch)
 
 		# close conn
-		self.client.close()
+		# self.client.close()
+
+	def end_process(self):
+		command = f"export DISPLAY=:0;pkill -f {self.process_name}"
+		# execute command on server
+		_stdin, stdout, _stderr = self.client.exec_command(command)
+
+		# close conn if the client is active
+		if self.client.get_transport() is not None:
+			if self.client.get_transport().is_active():
+				self.client.close()
 
 	def get_data(self,data_type):
+		if data_type not in self.sensor_types:
+			raise ValueError("SH environment: Unknown data type!")		
+
 		try:
-			with self.client as conn:
-				conn.connect(self.ip,username=self.user,pkey=self.pk)
+			#with self.client as conn:
+				# conn.connect(self.ip,username=self.user,pkey=self.pk)
 				# launch from launcher script placed on the PI
 				launch = f"export DISPLAY=:0;python {self.sf}/sense_emu_gui_{data_type}.py"
 				_stdin, stdout, _stderr = self.client.exec_command(launch)
 				# data = stdout.read().decode()
-				return round(float(stdout.read().decode().strip("\n")),1)				
+				return round(float(stdout.read().decode().strip("\n")),1)
 		except:
 			raise SensorConnectError
 
@@ -126,24 +145,24 @@ class SensorDummy():
 	def __init__(self,name):
 		self.type = "Local"
 		self.name = name
+		self.sensor_types = ['temp','vlaga','tlak']
 
 		self.hat = SenseHat()
 
 		# attempt to start GUI (probe connection)
-		process_name = 'sense_emu_gui'
+		self.process_name = 'sense_emu_gui'
 		try:
-			self.start_process(process_name)
+			self.start_process()
 		except:
 			raise SensorConnectError
-		
+
 		# temp = self.get_data('temp')
 		# vlaga = self.get_data('vlaga')
 		# tlak = self.get_data('tlak')
-	
-	def start_process(self,process_name):
-		from subprocess import Popen, PIPE, STDOUT
+
+	def start_process(self):
 		# get count of process:
-		command = f"pgrep -c {process_name}"
+		command = f"pgrep -c {self.process_name}"
 		# execute command on server
 		p = Popen(
 			command,
@@ -159,16 +178,29 @@ class SensorDummy():
 		if count == 0:
 			# if not running, spawn process:
 			Popen(
-				process_name,
+				self.process_name,
 				shell=True,
 				stdin=PIPE,
 				stdout=PIPE,
 				stderr=STDOUT,
 				close_fds=True
 				)
+		
+	def end_process(self):
+		# kill the GUI process:
+		command = f"kill -9 '{self.process_name}'"
+		# shutdown the GUI on the connected RPi
+		Popen(
+			command,
+			shell=True,
+			stdin=PIPE,
+			stdout=PIPE,
+			stderr=STDOUT,
+			close_fds=True
+			)
 
 	def get_data(self,data_type):
-		if data_type not in ['temp','vlaga','tlak']:
+		if data_type not in self.sensor_types:
 			raise ValueError("SH environment: Unknown data type!")
 		elif data_type == 'temp':
 			return self.hat.get_temperature()
@@ -183,65 +215,57 @@ class SensorTest():
 	def __init__(self,name):
 		self.type = "Test"
 		self.name = name
-		
+		self.sensor_types = ['temp','vlaga','tlak']
+
 		# temp = self.get_data('temp')
 		# vlaga = self.get_data('vlaga')
 		# tlak = self.get_data('tlak')
 
+	def start_process(self): ...
+		# nothing to do, only for SM iteration purposes
+
+	def end_process(self): ...
+		# nothing to do, only for SM iteration purposes
+
 	def get_data(self,data_type):
-		if data_type not in ['temp','vlaga','tlak']:
+		if data_type not in self.sensor_types:
 			raise ValueError("SH environment: Unknown data type!")
 		elif data_type == 'temp':
-			return round(rn.uniform(-15,35))
+			return round(uniform(-15,35))
 		elif data_type == 'vlaga':
-			return round(rn.uniform(0,100))
+			return round(uniform(0,100))
 		elif data_type == 'tlak':
-			return round(rn.uniform(950,1050))
+			return round(uniform(950,1050))
 
 class SensorManager():
 
-	# ASSUME RPIs CONFIGURED IN PARENT APP!
-	
-	class RPiUnutar(Enum):
-		NAME = 'unutar'
-		IP = "192.168.0.21"
-		USER = "marin"
-		PKF = "C:\\Users\\Marin\\.ssh\\id_ed25519"		# private key file
-		SF = "/media/sf_Raspberry_Pi_Shared_Folder"		# shared folder
-	
-	class RPiIzvan(Enum):
-		NAME = 'izvan'
-		IP = "192.168.0.22"
-		USER = "marin"
-		PKF = "C:\\Users\\Marin\\.ssh\\id_ed25519"		# private key file
-		SF = "/media/sf_Raspberry_Pi_Shared_Folder"		# shared folder
-
-	def __init__(self):
+	def __init__(self,data_loaded,sensor_data):
 
 		self.RPis = {}
 
-		for RPi in [self.RPiUnutar,self.RPiIzvan]:
+		for sensor in sensor_data:
 			# test RPi connection:
 			try:
-				# attempt to create ssh clients:
+				# no need to try to create ssh clients if no data loaded
+				assert data_loaded
+				# config data loaded, attempt to create ssh clients:
 				# IF SSH DON'T NEED TO RUN HOST PROCESS ON PI
-				self.RPis[RPi.NAME.value] = SensorSSH(
-						RPi.NAME.value,
-						RPi.IP.value,
-						RPi.USER.value,
-						RPi.PKF.value,
-						RPi.SF.value
-						)
+				self.RPis[sensor['NAME']] = SensorSSH(sensor)
 			except:
 				try:
 					# attempt to create dummy clients:
 					# IF NO SSH MUST RUN ON RPi TO START DUMMIES
-					self.RPis[RPi.NAME.value] = SensorDummy(RPi.NAME.value)
+					self.RPis[sensor['NAME']] = SensorDummy(sensor['NAME'])
 				except:
 					# no SSH RPi, no local RPi, fallback
 					# create test clients (return defaults)
-					self.RPis[RPi.NAME.value] = SensorTest(RPi.NAME.value)
-		print()
+					self.RPis[sensor['NAME']] = SensorTest(sensor['NAME'])
+	
+	def close_connections(self):
+		# connections are maintained throughout for faster readings
+		# they need to be closed prior to clearing SM for clean exit
+		for RPi in self.RPis.values():
+			RPi.end_process()
 
 # </SENSORS>
 # <INTERFACE> - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -304,7 +328,7 @@ class ScrolledListBox(AutoScroll, tk.Listbox):
 # <WIDGETS>  - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 
 class frmPostaja(ttk.LabelFrame):
-	
+
 	def __init__(self,master):
 
 		self.root = master
@@ -317,6 +341,13 @@ class frmPostaja(ttk.LabelFrame):
 		self.unos_postaja = tk.DoubleVar()
 		self.unos_postaja.set("")
 		self.unos_ugoda = -1
+		# station probe
+		self.dp = self.load_station_data()
+		self.lbl_postaja_v = None
+		self.probe_postaja = None
+		self.probe_loader = None
+		# progress bar
+		self.pb = None
 
 		self.configure_basic()
 
@@ -326,7 +357,7 @@ class frmPostaja(ttk.LabelFrame):
 		self.img_grey = []
 		self.img_get = []
 		self.init_images()
-		
+
 		self.attach_widgets()
 
 	def configure_basic(self):
@@ -335,6 +366,7 @@ class frmPostaja(ttk.LabelFrame):
 			text="Meteo podaci [C]")
 
 	def init_images(self):
+		from PIL import Image,ImageTk	# img adjustments
 
 		path_get = sys_path[0]+'\\'+f"IKONE_get.png"
 		self.img_get = ImageTk.PhotoImage(
@@ -344,7 +376,7 @@ class frmPostaja(ttk.LabelFrame):
 		for x in range(4):
 			path_active = sys_path[0]+'\\'+f"IKONE_{x}_active.jpg"
 			path_grey = sys_path[0]+'\\'+f"IKONE_{x}_grey.jpg"
-		
+
 			self.img_active.append(
 				ImageTk.PhotoImage(
 					Image.open(path_active).resize((36,36))
@@ -355,51 +387,121 @@ class frmPostaja(ttk.LabelFrame):
 					Image.open(path_grey).resize((36,36))
 					)
 				)
-		
+
 	def set_label_image(self,x):
 		if x == self.unos_ugoda:
 			self.lbl_ugoda_v[x].configure(image=self.img_active[x])
 		else:
 			self.lbl_ugoda_v[x].configure(image=self.img_grey[x])
-	
-	def get_data_postaja(self):
 
-		def worker():
-			# url_base = https://meteo.hr/proizvodi.php?section=podaci&param=xml_korisnici
-			url = 'https://vrijeme.hr/hrvatska_n.xml'
+	def load_station_data(self):
+		try:
+			with open(sys_path[0]+'\\'+"config.ini") as cf:
+				config = cp.RawConfigParser()
+				config.read_file(cf)
 
-			root = ET.fromstring(rget(url).text)
-			for grad in root.findall("Grad"):
-				if grad.find("GradIme").text == self.root.lokacija:
-					podaci = grad.find("Podatci")
-					t = float(podaci.find("Temp").text)
-					# h = float(podaci.find("Vlaga").text)
-					# p = float(podaci.find("Tlak").text)
-			
-			# tk var for lbl value
-			self.unos_postaja.set(round(t,1))
+				weather = config["Weather"]
 
-			# img signal (0-3)
-			self.unos_ugoda = 0
-			for x in self.unos_ugoda_bracket:
-				if t > x:
-					self.unos_ugoda += 1
-			
-			# adjust label images
-			for i in range(4):	
-				self.set_label_image(i)
-		
-		Thread(target=worker).start()
+				return {
+					"URL"			: weather["URL"],
+					"SUBTREE.TAG"	: weather["SUBTREE.TAG"],
+					"FILTER.TAG"	: weather["FILTER.TAG"],
+					"FILTER.VALUE"	: weather["FILTER.VALUE"],
+					"DATA.TAG"		: weather["DATA.TAG"],
+					"DATA_TEMP.TAG"	: weather["DATA_TEMP.TAG"],
+					"DATA_VLAGA.TAG": weather["DATA_VLAGA.TAG"],
+					"DATA_TLAK.TAG"	: weather["DATA_TLAK.TAG"]
+				}
+		except:
+			return {
+				"URL"			: 'https://vrijeme.hr/hrvatska_n.xml',
+				"SUBTREE.TAG"	: "Grad",
+				"FILTER.TAG"	: "GradIme",
+				"FILTER.VALUE"	: "Zagreb-Maksimir",
+				"DATA.TAG"		: "Podatci",
+				"DATA_TEMP.TAG"	: "Temp",
+				"DATA_VLAGA.TAG": "Vlaga",
+				"DATA_TLAK.TAG"	: "Tlak"
+			}	# defaults for testing
+			# for production, raise error:
+			# raise ConfigReadError()
+
+	def probe_load_worker(self):
+		# worker thread stops animation on data load
+		while True:
+			# check every half-second:
+			self.root.tksleep(0.5)
+			# whether data gathered:
+			if self.unos_postaja is not None:
+				# stop animation:
+				self.pb.stop()
+				# detach progress bar:
+				self.detach_progressbar()
+				# attach value label:
+				self.attach_value_label()
+				# probe loaded, set loader to none
+				self.probe_loader = None
+				# exit loop, end the thread
+				break
+
+	def probe_load(self):
+		# destroy the label if exists:
+		self.detach_sensor_label()
+		# reset the variable if value set:
+		self.unos_postaja = None
+		# attach progress bar:
+		self.attach_progressbar()
+		# start animation:
+		self.pb.start()
+		# create the loading probe
+		self.probe_loader = th.Thread(target=self.probe_load_worker)
+		# start the loading probe
+		self.probe_loader.start()
+		# start the scraping probe
+		self.get_station_data()
+
+	def get_station_worker(self):
+		from requests import get as rget			# xml retrieve
+		import xml.etree.ElementTree as ET			# xml parsing
+
+		try:
+			root = ET.fromstring(rget(self.dp["URL"]).text)
+			for grad in root.findall(self.dp["SUBTREE.TAG"]):
+				if grad.find(self.dp["FILTER.TAG"]).text == self.dp["FILTER.VALUE"]:
+					podaci = grad.find(self.dp["DATA.TAG"])
+					t = float(podaci.find(self.dp["DATA_TEMP.TAG"]).text)
+					# h = float(podaci.find(self.dp["DATA_VLAGA.TAG"]).text)
+					# p = float(podaci.find(self.dp["DATA_TLAK.TAG"]).text)
+		except:
+			# default to 0 for testing
+			t = 0
+			# for production, raise error:
+			# raise ConfigReadError()
+
+		# img signal (0-3)
+		self.unos_ugoda = 0
+		for x in self.unos_ugoda_bracket:
+			if t > x:
+				self.unos_ugoda += 1
+		# adjust label images
+		for i in range(4):
+			self.set_label_image(i)
+
+		# set tk var for lbl value (loader worker signal)
+		self.unos_postaja = tk.DoubleVar(value=round(t,1))
+		# probe finished, set to none
+		self.probe_postaja = None
+
+	def get_station_data(self):
+		self.probe_postaja = th.Thread(target=self.get_station_worker)
+		self.probe_postaja.start()
 
 	def attach_widgets(self):
 
 		lbl_postaja = ttk.Label(self,text='Ref. postaja:',style='lbl_naslov.TLabel')
 		lbl_postaja.place(x=240, y=20, height=22, width=100, bordermode='ignore')
 
-		lbl_postaja_v = ttk.Label(self,textvariable=self.unos_postaja,style='lbl_vrijednost.TLabel')
-		lbl_postaja_v.place(x=240, y=40, height=40, width=100, bordermode='ignore')
-
-		for i in range(4):	
+		for i in range(4):
 			self.lbl_ugoda_v.append(
 				ttk.Label(self,style='lbl_ugoda.TLabel')
 			)
@@ -411,7 +513,27 @@ class frmPostaja(ttk.LabelFrame):
 		btn_get.configure(
 			style='btn_get.TButton',
 			image=self.img_get,
-			command=self.get_data_postaja)
+			command=self.probe_load)
+
+	def attach_value_label(self):
+		self.lbl_postaja_v = ttk.Label(self,textvariable=self.unos_postaja,style='lbl_vrijednost.TLabel')
+		self.lbl_postaja_v.place(x=240, y=40, height=40, width=100, bordermode='ignore')
+
+	def detach_sensor_label(self):
+		if self.lbl_postaja_v and self.lbl_postaja_v.winfo_exists():
+			# if the label exists, destroy it:
+			self.lbl_postaja_v.destroy()
+			self.lbl_postaja_v = None
+
+	def attach_progressbar(self):
+		self.pb = ttk.Progressbar(
+			self,orient='horizontal',mode='indeterminate',length=60
+			)
+		self.pb.place(x=270,y=40,anchor='center')
+
+	def detach_progressbar(self):
+		self.pb.destroy()
+		self.pb = None		
 
 class frmBasic(ttk.LabelFrame):
 
@@ -514,15 +636,15 @@ class frmBasic(ttk.LabelFrame):
 		pass
 
 class frmTemp(frmBasic):
-	
+
 	def __init__(self,master):
 		# nothing to do, template method
 		# initialize master
 		super().__init__(master)
-	
+
 	def get_data_column(self):
 		return 'temp'
-	
+
 	def get_sensor_data(self):
 		self.unos_unutar.set("")
 		self.unos_izvan.set("")
@@ -533,15 +655,15 @@ class frmTemp(frmBasic):
 			text="Temperatura [C]")
 
 class frmVlaga(frmBasic):
-	
+
 	def __init__(self,master):
 		# nothing to do, template method
 		# initialize master
 		super().__init__(master)
-	
+
 	def get_data_column(self):
 		return 'vlaga'
-	
+
 	def get_sensor_data(self):
 		self.unos_unutar.set("")
 		self.unos_izvan.set("")
@@ -552,15 +674,15 @@ class frmVlaga(frmBasic):
 			text="Vlažnost [%]")
 
 class frmTlak(frmBasic):
-	
+
 	def __init__(self,master):
 		# nothing to do, template method
 		# initialize master
 		super().__init__(master)
-	
+
 	def get_data_column(self):
 		return 'tlak'
-	
+
 	def get_sensor_data(self):
 		self.unos_unutar.set("")
 		self.unos_izvan.set("")
@@ -572,18 +694,22 @@ class frmTlak(frmBasic):
 
 class tkRoot(tk.Tk):
 
-	def __init__(self,DB_link,SM_link,lokacija):
+	def __init__(self,DB_link):
 		# database link
 		self.DB_link:'DB' = DB_link
 		# sensor manager link
-		self.SM_link:'SensorManager' = SM_link
-		# lokacija objekta
-		self.lokacija = lokacija
+		self.SM_link:'SensorManager' = None
 		# live sensor reading
+		self.sensor_names = [
+			{'NAME':'unutar'},
+			{'NAME':'izvan'}
+			]
+		self.lbl_sensor = None
 		self.probe = None
-		# thread ordering
-		self.probe_thread = None
-		self._probe_kill = tEvent()
+		self.probe_loader = None
+		self._probe_kill = th.Event()
+		# progress bar
+		self.pb = None
 
 		super().__init__()
 
@@ -592,6 +718,43 @@ class tkRoot(tk.Tk):
 
 		self.attach_frames()
 		self.attach_widgets()
+
+	def load_sensor_data(self):
+		sensor_data = []
+		names_test:'list' = self.sensor_names.copy()
+
+		try:
+			with open(sys_path[0]+'\\'+"config.ini") as cf:
+				config = cp.RawConfigParser()
+				config.read_file(cf)
+				assert config.has_option("DEFAULT","RPis")
+				
+				for sensor in [x.strip() for x in config["DEFAULT"]["RPis"].split(',')]:
+					data = {
+						'NAME'	: config[sensor]['NAME'],
+						'IP'	: config[sensor]['IP'],
+						'USER'	: config[sensor]['USER'],
+						'PKF'	: config[sensor]['PKF'],	# private key file
+						'SF'	: config[sensor]['SF']		# shared folder
+					}
+					# basic check:
+					assert all(v is not None for v in data.values())
+					# strong names check (sections need to be in order):
+					assert data['NAME'] == names_test.pop(0)['NAME']
+					# IPs check:
+					from ipaddress import ip_address
+					assert ip_address(data['IP'])
+					# paths check (pathvalidate)
+	 				# ... PKF
+	  				# ... SF
+
+					sensor_data.append(data)
+
+			return (True,sensor_data)
+
+		except:
+			# same shape dict, only name keys
+			return (False,self.sensor_names)
 
 	def configure_basic(self):
 		self.title("PROGNOZA")
@@ -615,7 +778,7 @@ class tkRoot(tk.Tk):
 
 	def save(self):
 
-		# COLLECT		
+		# COLLECT
 		data = {
 			'temp_unutar'	: self.frm_temp.unos_unutar.get(),
 			'temp_izvan'	: self.frm_temp.unos_izvan.get(),
@@ -639,7 +802,7 @@ class tkRoot(tk.Tk):
 			try:
 				self.DB_link.insert_data(data)
 			except Exception as e:
-				raise DBWriteError()		
+				raise DBWriteError()
 
 		# refresh all lists
 		self.refresh_all_lists()
@@ -652,7 +815,7 @@ class tkRoot(tk.Tk):
 		#
 		# stop button unchanged
 		#
-	
+
 	def delete(self):
 		# only 1 table in DB so it doesn't matter
 		# no choosing, might as well pick from inst
@@ -671,26 +834,128 @@ class tkRoot(tk.Tk):
 		#
 		# stop button unchanged
 		#
-	
-	def probe_start(self):	
-		# enable save button
-		self.btn_spremi.configure(state = 'normal')
-		# delete button unchanged
-		#
-		# disable start button
-		self.btn_pokreni.configure(state = 'disabled')
-		# enable stop button
-		self.btn_zaustavi.configure(state = 'normal')
 
-		self.probe_read()
+	# <SENSOR PROBE>
+			
+	def probe_load_worker(self):
+		# worker thread stops animation on sensor load
+		while True:
+			# check every half-second:
+			self.tksleep(0.5)
+			# whether sensors established:
+			if self.SM_link is not None:
+				# stop animation:
+				self.pb.stop()
+				# detach progress bar:
+				self.detach_progressbar()
+				# attach status label:
+				self.attach_sensor_label()
+				# update start button text
+				self.btn_pokreni.configure(					
+					text='Pokreni', state='normal')
+				# probe loaded, set loader to none
+				self.probe_loader = None
+				# exit loop, end the thread
+				break
+
+	def probe_load(self):
+		# on first start, try to load the sensors
+
+		# attach progress bar:
+		self.attach_progressbar()
+		# start animation:
+		self.pb.start()
+		# create the loading probe
+		self.probe_loader = th.Thread(target=self.probe_load_worker)
+		# start the loading probe
+		self.probe_loader.start()
+		# start the linking probe
+		self.probe_create_link()
+
+	def probe_link_worker(self):
+		data_loaded, sensor_data = self.load_sensor_data()
+		self.SM_link = SensorManager(data_loaded, sensor_data)
+
+	def probe_create_link(self):
+		try:
+			# generate/connect to sensors, break on error
+			self.probe = th.Thread(target=self.probe_link_worker).start()			
+		except Exception as e:
+			# kill all new threads
+			self._probe_kill.set()
+			# raise error
+			raise SensorConnectError()
+	
+	def probe_disable_link(self):
+		#self.SM_link.close_connections()
+		self.SM_link = None
+
+	def probe_start(self):
+		# if sensors not yet established, start load procedure:
+		if self.SM_link == None:
+			self.probe_load()
+			self.btn_pokreni.configure(state='disabled')
+		else:
+			# start reading sensor data
+			self.probe_loader = None
+			self.probe_read()
+
+			# enable save button
+			self.btn_spremi.configure(state = 'normal')
+			# delete button unchanged
+			#
+			# disable start button
+			self.btn_pokreni.configure(state = 'disabled')
+			# enable stop button
+			self.btn_zaustavi.configure(state = 'normal')
+
+	def probe_stop_worker(self):
+		from re import findall as re_findall
+		while True:
+			# check every half-second:
+			self.tksleep(0.5)
+			for t in th.enumerate()[1:]:
+				# exclude main thread (0 in enumerate)
+				# wait for all read workers to finish
+				t_test = re_findall(r'\(.*?\)',t.name)
+				if t_test == ['(probe_read_worker)']:
+					t.join()
+
+			# safe to close RPi conns:
+			self.SM_link.close_connections()
+			# unlink Sensor Manager:
+			self.probe_disable_link()
+			# prepare for new probe creation:
+			self._probe_kill.clear()
+
+			# stop animation:
+			self.pb.stop()
+			# detach progress bar:
+			self.detach_progressbar()	
+			# clear all readings:
+			self.clear_reading()
+
+			# exit loop, end thread:
+			break
 
 	def probe_stop(self):
+	
+		# detach status label:
+		self.detach_sensor_label()
+		# attach progress bar:
+		self.attach_progressbar()
+		# start animation:
+		self.pb.start()
+
+		# stop new probe threads:
 		self._probe_kill.set()
+		# stop the monitoring process:
 		self.after_cancel(self.probe)
-		self.probe = None
-		# wait a bit until probes return
-		self.tksleep(3)
-		self.clear_reading()
+		# start thread shutdown monitor
+		self.probe = th.Thread(target=self.probe_stop_worker).start()	
+		
+		# set start button to "create conn" mode
+		self.btn_pokreni.configure(text='Otvori')
 
 		# disable save button
 		self.btn_spremi.configure(state = 'disabled')
@@ -700,48 +965,57 @@ class tkRoot(tk.Tk):
 		self.btn_pokreni.configure(state = 'normal')
 		# disable stop button
 		self.btn_zaustavi.configure(state = 'disabled')
-	
+
 	def probe_killed(self):
-		return self._probe_kill.isSet()
-	
+		return self._probe_kill.is_set()
+
+	def probe_read_worker(self):
+		# load sensor data into labels
+		self.show_reading()
+		# reset the monitoring probe
+		self.probe_loader = None
+
 	def probe_read(self):
+		# if stop signal don't create new threads:
+		if self.probe_killed():
+			return
+		# don't crowd probes, if active no need for new ones
+		if self.probe_loader is None:
+			# prepare the new monitoring probe
+			self.probe_loader = th.Thread(target=self.probe_read_worker)
+			# start the monitoring probe:
+			self.probe_loader.start()
 
-		def worker():
-			if self.probe_killed():
-				return
-			self.show_reading()
-			self.probe_thread = None			
-		
-		if self.probe_thread == None:
-			self.probe_thread = Thread(target=worker)
-			self.probe_thread.start()
-
+		# take new readings every second
 		self.probe = self.after(1000,self.probe_read)
+
+	# </SENSOR PROBE>
 
 	def show_reading(self):
 
-			self.frm_temp.unos_unutar.set(self.SM_link.RPis["unutar"].get_data('temp'))
-			self.frm_temp.unos_izvan.set(self.SM_link.RPis["izvan"].get_data('temp'))
-		
-			self.frm_vlaga.unos_unutar.set(self.SM_link.RPis["unutar"].get_data('vlaga'))
-			self.frm_vlaga.unos_izvan.set(self.SM_link.RPis["izvan"].get_data('vlaga'))
-		
-			self.frm_tlak.unos_unutar.set(self.SM_link.RPis["unutar"].get_data('tlak'))
-			self.frm_tlak.unos_izvan.set(self.SM_link.RPis["izvan"].get_data('tlak'))
+		self.frm_temp.unos_unutar.set(self.SM_link.RPis["unutar"].get_data('temp'))
+		self.frm_temp.unos_izvan.set(self.SM_link.RPis["izvan"].get_data('temp'))
+
+		self.frm_vlaga.unos_unutar.set(self.SM_link.RPis["unutar"].get_data('vlaga'))
+		self.frm_vlaga.unos_izvan.set(self.SM_link.RPis["izvan"].get_data('vlaga'))
+
+		self.frm_tlak.unos_unutar.set(self.SM_link.RPis["unutar"].get_data('tlak'))
+		self.frm_tlak.unos_izvan.set(self.SM_link.RPis["izvan"].get_data('tlak'))
 
 	def clear_reading(self):
+
 		self.frm_temp.unos_unutar.set("")
 		self.frm_temp.unos_izvan.set("")
-	
+
 		self.frm_vlaga.unos_unutar.set("")
 		self.frm_vlaga.unos_izvan.set("")
-	
+
 		self.frm_tlak.unos_unutar.set("")
 		self.frm_tlak.unos_izvan.set("")
 
 	def attach_frames(self):
 		self.geometry("430x680")
-		
+
 		self.frm_postaja = frmPostaja(self)
 		self.frm_postaja.place(x=15, y=10, height=85, width=400)
 		self.frm_temp = frmTemp(self)
@@ -750,7 +1024,7 @@ class tkRoot(tk.Tk):
 		self.frm_vlaga.place(x=15, y=275, height=170, width=400)
 		self.frm_tlak = frmTlak(self)
 		self.frm_tlak.place(x=15, y=450, height=170, width=400)
-	
+
 	def attach_widgets(self):
 
 		self.btn_spremi = ttk.Button(self)
@@ -768,17 +1042,11 @@ class tkRoot(tk.Tk):
 			state=('normal' if self.DB_link.select_data('temp') else 'disabled'),
 			style='btn_general.TButton',
 			command=self.delete)
-		
-		# collect loaded sensor type initials into a string
-		sensor_types = f"< {' | '.join([x.type[0] for x in self.SM_link.RPis.values()])} >"
-
-		lbl_sensor = ttk.Label(self,text=sensor_types,style='lbl_sensor.TLabel')
-		lbl_sensor.place(x=185, y=635, height=30, width=60, bordermode='ignore')
 
 		self.btn_pokreni = ttk.Button(self)
 		self.btn_pokreni.place(x=255, y=635, height=30, width=75, bordermode='ignore')
 		self.btn_pokreni.configure(
-			text='Pokreni',
+			text='Otvori',
 			state='normal',
 			style='btn_general.TButton',
 			command=self.probe_start)
@@ -790,6 +1058,32 @@ class tkRoot(tk.Tk):
 			state='disabled',
 			style='btn_general.TButton',
 			command=self.probe_stop)
+
+	def attach_sensor_label(self):
+		if self.SM_link:
+			# collect loaded sensor type initials into a string
+			sensor_types = f"< {' | '.join([x.type[0] for x in self.SM_link.RPis.values()])} >"
+
+			self.lbl_sensor = ttk.Label(self,text=sensor_types,style='lbl_sensor.TLabel')
+			self.lbl_sensor.place(x=185, y=635, height=30, width=60, bordermode='ignore')
+		else:
+			raise SensorConnectError
+
+	def detach_sensor_label(self):
+		if self.lbl_sensor and self.lbl_sensor.winfo_exists():
+			# if the label exists, destroy it:
+			self.lbl_sensor.destroy()
+			self.lbl_sensor = None
+
+	def attach_progressbar(self):
+		self.pb = ttk.Progressbar(
+			self,orient='horizontal',mode='indeterminate',length=60
+			)
+		self.pb.place(x=215,y=650,anchor='center')
+
+	def detach_progressbar(self):
+		self.pb.destroy()
+		self.pb = None
 
 	def style_config(self):
 		self.style = ttk.Style(self)
@@ -851,7 +1145,7 @@ class tkRoot(tk.Tk):
 
 	def __enter(self):
 		return self
-	
+
 	def __exit__(self,exc_type=None,exc_value=None,exc_traceback=None):
 		if self.probe:
 			self.probe_stop()
@@ -966,19 +1260,19 @@ class DB():
 					{	"temp_unutar":20.0,"vlaga_unutar":50.0,"tlak_unutar":1020.0,
 						"temp_izvan":16.0,"vlaga_izvan":40.0,"tlak_izvan":1010.0,
 	  					"date":"2024-03-20","time":"10:00:00"},
-						  
+
 					{	"temp_unutar":21.0,"vlaga_unutar":51.0,"tlak_unutar":1021.0,
 						"temp_izvan":17.0,"vlaga_izvan":41.0,"tlak_izvan":1011.0,
 	  					"date":"2024-03-21","time":"11:00:00"},
-						  
+
 					{	"temp_unutar":22.0,"vlaga_unutar":52.0,"tlak_unutar":1022.0,
 						"temp_izvan":18.0,"vlaga_izvan":42.0,"tlak_izvan":1012.0,
 	  					"date":"2024-03-22","time":"12:00:00"},
-						  
+
 					{	"temp_unutar":23.0,"vlaga_unutar":53.0,"tlak_unutar":1023.0,
 						"temp_izvan":19.0,"vlaga_izvan":43.0,"tlak_izvan":1013.0,
 	  					"date":"2024-03-23","time":"13:00:00"},
-						  
+
 					{	"temp_unutar":24.0,"vlaga_unutar":54.0,"tlak_unutar":1024.0,
 						"temp_izvan":20.0,"vlaga_izvan":44.0,"tlak_izvan":1014.0,
 	  					"date":"2024-03-24","time":"14:00:00"},
@@ -1009,7 +1303,7 @@ class DB():
 
 		if data_type not in ['temp','vlaga','tlak']:
 			raise ValueError("Unknown data type!")
-		
+
 		# both sensors baked into data selection
 		# if needed separately, pass sensor as arg
 		stmt = select(
@@ -1045,19 +1339,9 @@ class App():
 			self.database = DB()
 		except Exception as e:
 			raise DBConnectError()
-
-		try:
-			# generate/connect to sensors, break on error
-			self.sensor_manager = SensorManager()
-		except Exception as e:
-			raise SensorConnectError()
-		
-		# ASSUME LOCATION CONFIGURED IN PARENT APP!
-		lokacija = "Zagreb-Maksimir"
-
 		try:
 			# generate tk interface, break on error
-			self.interface_root = tkRoot(self.database,self.sensor_manager,lokacija)
+			self.interface_root = tkRoot(self.database)
 		except Exception as e:
 			raise IFOpenError()
 
