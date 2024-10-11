@@ -1,0 +1,2 @@
+Analizirajte datoteku cars.csv. Iscrtajte histogram težine (Weight) po državama i usporedite rezultate.
+Zapišite kratak zaključak.
